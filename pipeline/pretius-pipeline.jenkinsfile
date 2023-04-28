@@ -1,0 +1,304 @@
+pipeline {
+    agent any
+   
+    environment {
+        //Project Settings
+        GIT_REPOSITORY = 'https://github.com/Pretius/pretius-apex-lifecycle-aligned-sample-customers'
+        GIT_BRANCH = 'main'
+        CREATE_BUILD = false
+        DEVELOPMENT_DB_CONN = 'development-username/development-password@//development-host:1521/my-dev-db'
+        APPLICATION_ALIAS = "sample_customers"
+        // Jenkins Settings
+        BASE_LOCATION = "/home/opc"
+        PWD_LOCATION = sh(returnStdout: true, script: 'pwd').trim()
+        GIT_FOLDER = 'project'
+        GIT_WORKAREA = "${PWD_LOCATION}/${GIT_FOLDER}"
+        PROJECT_SHORT = 'scu'
+        SCRIPTS_LOCATION = '/home/opc/pretius-apex-lifecycle-aligned-utils/pipeline-scripts'
+        BUILD_NUMBER = env.BUILD_NUMBER.toInteger()
+        BUILD_NUMBER_PADDED = String.format("%05d", BUILD_NUMBER)
+        ZIP_FILE = "${GIT_FOLDER}_${BUILD_NUMBER_PADDED}.zip"
+        MAX_CONCURRENT_BUILDS = 1
+        PORT_OFFSET = 0
+        PORT_DB_LISTENER = (8521 + PORT_OFFSET).toString()
+        PORT_DB_OMA = (8500 + PORT_OFFSET).toString()
+        PORT_HTTP = (8023 + PORT_OFFSET).toString()
+        PORT_HTTPS = (9043 + PORT_OFFSET).toString()
+        DB = "localhost:${PORT_DB_LISTENER}/FREEPDB1"
+        BUILD_PASSWORD = 'E'
+        SYS = "sys/${BUILD_PASSWORD}@//${DB}"
+        SYS_AS_SYSDBA = "${SYS} AS SYSDBA"
+        TEMP_STAGE_LOCATION = "/tmp/stage_${BUILD_NUMBER}"
+        CYPRESS_USERNAME = 'TEST_USER'
+        CYPRESS_PASSWORD = 'E'
+        APEX_URL = "http://localhost:${PORT_HTTP}/ords"
+        CONTAINER_NAME = "23cjenkins${PROJECT_SHORT}${BUILD_NUMBER}"
+    }
+        
+    stages {
+        stage('Clear Workspace') {
+            steps {
+                deleteDir()
+            }
+        }
+
+        stage('Clone Git repository') {
+            steps {
+                dir("${GIT_FOLDER}") {
+                    git branch: "${GIT_BRANCH}", 
+                    url: "${GIT_REPOSITORY}"
+                }
+            }
+        }
+
+        stage('Create Temp Folder') {
+            steps {
+                script {
+                    sh "cd ${BASE_LOCATION}"
+                    sh "sh ${SCRIPTS_LOCATION}/createtempfolder.sh ${TEMP_STAGE_LOCATION}"
+                }
+            }
+        }
+
+        stage('Print Environment Variables') {
+            environment {
+                vAPEX_TARGET_APP_ID = sh(script: "grep 'p_default_application_id' ${GIT_WORKAREA}/application/set_environment.sql | cut -d'>' -f2 | cut -d'<' -f1 | sed -e 's/\\r//g'", returnStdout: true).trim()
+                vWORKSPACE_NAME = sh(script: "grep 'p_short_name' \"\$(find \"${GIT_WORKAREA}/workspace\" -maxdepth 1 -type f -name \"*.sql\" | head -n 1)\" | cut -d\"'\" -f2", returnStdout: true).trim()
+                vDEFAULT_OWNER = sh(script: "grep 'p_default_owner' \"${GIT_WORKAREA}/application/set_environment.sql\" | cut -d\"'\" -f2", returnStdout: true).trim()
+                vDEFAULT_OWNER_CONN = "${vDEFAULT_OWNER}/${BUILD_PASSWORD}@//${DB}"
+            }
+            steps {
+                sh """
+                    echo "BASE_LOCATION: ${BASE_LOCATION}"
+                    echo "GIT_FOLDER: ${GIT_FOLDER}"
+                    echo "GIT_WORKAREA: ${GIT_WORKAREA}"
+                    echo "PROJECT_SHORT: ${PROJECT_SHORT}"
+                    echo "SCRIPTS_LOCATION: ${SCRIPTS_LOCATION}"
+                    echo "BUILD_NUMBER: ${BUILD_NUMBER}"
+                    echo "BUILD_NUMBER_PADDED: ${BUILD_NUMBER_PADDED}"
+                    echo "ZIP_FILE: ${ZIP_FILE}"
+                    echo "MAX_CONCURRENT_BUILDS: ${MAX_CONCURRENT_BUILDS}"
+                    echo "PORT_OFFSET: ${PORT_OFFSET}"
+                    echo "PORT_DB_LISTENER: ${PORT_DB_LISTENER}"
+                    echo "PORT_DB_OMA: ${PORT_DB_OMA}"
+                    echo "PORT_HTTP: ${PORT_HTTP}"
+                    echo "PORT_HTTPS: ${PORT_HTTPS}"
+                    echo "DB: ${DB}"
+                    echo "BUILD_PASSWORD: ${BUILD_PASSWORD}"
+                    echo "SYS: ${SYS}"
+                    echo "SYS_AS_SYSDBA: ${SYS_AS_SYSDBA}"
+                    echo "TEMP_STAGE_LOCATION: ${TEMP_STAGE_LOCATION}"
+                    echo "CYPRESS_USERNAME: ${CYPRESS_USERNAME}"
+                    echo "CYPRESS_PASSWORD: ${CYPRESS_PASSWORD}"
+                    echo "APEX_URL: ${APEX_URL}"
+                    echo "CONTAINER_NAME: ${CONTAINER_NAME}"
+                    echo "CREATE_BUILD: ${CREATE_BUILD}"
+                    echo "DEVELOPMENT_DB_CONN: ${DEVELOPMENT_DB_CONN}"
+                """
+                // Environment Specifics
+                // Hardcode over the curly bracketed variables if you want custom values
+                sh 'echo ${vAPEX_TARGET_APP_ID} > /tmp/env_apex_target_app_id.txt'
+                sh 'echo ${vWORKSPACE_NAME} > /tmp/env_workspace_name.txt'
+                sh 'echo ${vDEFAULT_OWNER} > /tmp/env_default_owner_id.txt'
+                sh 'echo ${vDEFAULT_OWNER_CONN} > /tmp/env_default_owner_conn.txt'
+            }
+        }
+
+        stage('Spawn Docker Container') {
+            steps {
+                sh "cd ${BASE_LOCATION}"
+                sh "loginctl enable-linger \$UID"
+                sh "docker run -d -it --name ${CONTAINER_NAME} -p ${PORT_DB_LISTENER}:1521 -p ${PORT_DB_OMA}:5500 -p ${PORT_HTTP}:8080 -p ${PORT_HTTPS}:8443 -e ORACLE_PWD=${BUILD_PASSWORD} localhost/23cfreeapeximg"
+            }
+            post {
+                always {
+                    sh "cd ${PWD_LOCATION}"
+                }
+            }
+        }
+        stage('Create Build') {
+            when {
+                expression {
+                    CREATE_BUILD == 'true'
+                }
+            }
+            steps {
+                sh """
+                    echo "making a build"
+                    # cd ${BASE_LOCATION}
+                    # sh ${SCRIPTS_LOCATION}/apexgit2buildzip.sh ${GIT_WORKAREA} ${BUILD_NUMBER_PADDED}
+                    # mv ${ZIP_FILE} ${GIT_WORKAREA}/build
+                    # U_ZIPFILE=${ZIP_FILE}
+                """
+            }
+        }
+        stage('Locate Build') {
+            when {
+                expression {
+                    CREATE_BUILD != 'true'
+                }
+            }
+            steps {
+                sh """
+                ls ${GIT_WORKAREA}/build/*.zip -t | head -1 > ${TEMP_STAGE_LOCATION}/build_zip_file.txt
+                """
+            }
+        }
+        stage('Extract Build') {
+            steps {
+                script {
+                    sh "cd ${BASE_LOCATION}"
+                    sh "sh ${SCRIPTS_LOCATION}/extractbuild.sh \$(cat ${TEMP_STAGE_LOCATION}/build_zip_file.txt) ${TEMP_STAGE_LOCATION}"
+                }
+            }
+        }
+        stage('Wait until APEX is ready') {
+            steps {
+                script {
+                    sh "cd ${BASE_LOCATION}"
+                    sh "sh ${SCRIPTS_LOCATION}/waitForAPEX.sh ${APEX_URL}"
+                }
+            }
+        }
+        stage('Create DB Users') {
+            steps {
+                script {
+                    sh "cd ${BASE_LOCATION}"
+                    sh "sh ${SCRIPTS_LOCATION}/createdbschemas.sh ${SYS} ${TEMP_STAGE_LOCATION} ${SCRIPTS_LOCATION}"
+                }
+            }
+        }
+        stage('Install Workspace(s)') {
+            steps {
+                script {
+                    sh "cd ${BASE_LOCATION}"
+                    sh "sh ${SCRIPTS_LOCATION}/apexinstallworkspace.sh '${TEMP_STAGE_LOCATION}/workspace' ${SYS}"
+                }
+            }
+        }
+        stage('Deploy Other Schemas') {
+            steps {
+                script {
+                    sh "cd ${BASE_LOCATION}"
+                    sh "sh ${SCRIPTS_LOCATION}/apexinstallotherschemas.sh ${DB} '${TEMP_STAGE_LOCATION}/other_schemas' ${BUILD_PASSWORD}"
+                }
+            }
+        }
+        stage('Install utPLSQL') {
+            steps {
+                script {
+                    sh "cd ${BASE_LOCATION}"
+                    sh "sh ${SCRIPTS_LOCATION}/installutPLSQLlatest.sh ${BASE_LOCATION} ${SYS}"
+                }
+            }
+        }
+        stage('Deploy Pre') {
+            environment {
+                DEFAULT_OWNER = readFile('/tmp/env_default_owner_id.txt').trim()
+                DEFAULT_OWNER_CONN = readFile('/tmp/env_default_owner_conn.txt').trim()
+            }
+            steps {
+                script {
+                    sh "cd ${BASE_LOCATION}"
+                    sh "sh ${SCRIPTS_LOCATION}/apexinstallchangeset.sh ${TEMP_STAGE_LOCATION}/changelogs pre.xml ${DEFAULT_OWNER_CONN}"
+                }
+            }
+        }
+        stage('Deploy Build') {
+            environment {
+                APEX_TARGET_APP_ID = readFile('/tmp/env_apex_target_app_id.txt').trim()
+                WORKSPACE_NAME = readFile('/tmp/env_workspace_name.txt').trim()
+                DEFAULT_OWNER = readFile('/tmp/env_default_owner_id.txt').trim()
+                DEFAULT_OWNER_CONN = readFile('/tmp/env_default_owner_conn.txt').trim()
+            }
+            steps {
+                script {
+                    sh "cd ${BASE_LOCATION}"
+                    sh "sh ${SCRIPTS_LOCATION}/apexinstallbuild.sh ${TEMP_STAGE_LOCATION} ${APEX_TARGET_APP_ID} ${WORKSPACE_NAME} ${DEFAULT_OWNER_CONN} ${APPLICATION_ALIAS}"
+                }
+            }
+        }
+        stage('Deploy Post') {
+            environment {
+                DEFAULT_OWNER = readFile('/tmp/env_default_owner_id.txt').trim()
+                DEFAULT_OWNER_CONN = readFile('/tmp/env_default_owner_conn.txt').trim()
+            }
+            steps {
+                sh """
+                    cd ${BASE_LOCATION}
+                    sh ${SCRIPTS_LOCATION}/apexinstallchangeset.sh ${TEMP_STAGE_LOCATION}/changelogs post.xml ${DEFAULT_OWNER_CONN}
+                """
+            }
+        }
+        stage('Deploy data') {
+            environment {
+                DEFAULT_OWNER = readFile('/tmp/env_default_owner_id.txt').trim()
+                DEFAULT_OWNER_CONN = readFile('/tmp/env_default_owner_conn.txt').trim()
+            }
+            steps {
+                sh """
+                    cd ${BASE_LOCATION}
+                    sh ${SCRIPTS_LOCATION}/apexinstallchangeset.sh ${TEMP_STAGE_LOCATION}/data data.xml ${DEFAULT_OWNER_CONN}
+                """
+            }
+        }
+        stage('Deploy Test-only') {
+            environment {
+                DEFAULT_OWNER = readFile('/tmp/env_default_owner_id.txt').trim()
+                DEFAULT_OWNER_CONN = readFile('/tmp/env_default_owner_conn.txt').trim()
+            }
+            steps {
+                sh """
+                    cd ${BASE_LOCATION}
+                    sh ${SCRIPTS_LOCATION}/apexinstallchangeset.sh ${TEMP_STAGE_LOCATION}/changelogs test-only.xml ${DEFAULT_OWNER_CONN}
+                """
+            }
+        }
+        stage('Run utPLSQL Tests') {
+            environment {
+                DEFAULT_OWNER = readFile('/tmp/env_default_owner_id.txt').trim()
+                DEFAULT_OWNER_CONN = readFile('/tmp/env_default_owner_conn.txt').trim()
+            }
+            steps {
+                sh """
+                    cd ${BASE_LOCATION}
+                    sh ${SCRIPTS_LOCATION}/ut_junit_reporter.sh ${DEFAULT_OWNER_CONN} ${PWD_LOCATION}
+                """
+            }
+        }
+        stage('Run Cypress Tests') {
+            environment {
+                APEX_TARGET_APP_ID = readFile('/tmp/env_apex_target_app_id.txt').trim()
+            }
+            steps {
+                sh """
+                    cd ${GIT_WORKAREA}
+                    CYPRESS_username=${CYPRESS_USERNAME}
+                    CYPRESS_password=${CYPRESS_PASSWORD}
+                    npx cypress run #--config baseUrl=${APEX_URL}/f?p=${APEX_TARGET_APP_ID}:LOGIN
+                """
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                sh """
+                    cd ${BASE_LOCATION}
+                    docker stop ${CONTAINER_NAME}
+                    docker rm ${CONTAINER_NAME}
+                """
+                def buildZipFile = sh(script: " basename \$(cat ${TEMP_STAGE_LOCATION}/build_zip_file.txt)", returnStdout: true).trim()
+                archiveArtifacts "${GIT_FOLDER}/build/${buildZipFile}, ${GIT_FOLDER}/cypress/videos/*"
+                try {
+                    junit 'ut_junit_reporter/*.xml'
+                } catch (e) {
+                    echo "No unit test reports found."
+                }
+            }
+        }
+    }
+}
+
+
